@@ -9,27 +9,45 @@
 
 // Device function: Convert u64 to ASCII string (decimal representation)
 // Returns the number of digits written
+// Optimized version using fewer divisions by processing digits in chunks of 4
 __device__ int u64_to_string(unsigned long long value, unsigned char* buffer) {
     if (value == 0) {
         buffer[0] = '0';
         return 1;
     }
 
-    // Find number of digits
-    unsigned long long temp = value;
-    int num_digits = 0;
-    while (temp > 0) {
-        temp /= 10;
-        num_digits++;
+    // Convert using fast division by powers of 10
+    // Temporary buffer to store digits in reverse order
+    unsigned char temp[20];  // Max digits for u64 is 20
+    int count = 0;
+
+    // Unrolled division: process 4 digits at a time to reduce expensive division ops
+    // Division by 10000 is much faster than four separate divisions by 10
+    while (value >= 10000) {
+        unsigned long long q = value / 10000;  // Quotient
+        unsigned int r = value - q * 10000;     // Remainder (last 4 digits)
+
+        // Extract 4 digits from remainder (stored in reverse)
+        temp[count++] = '0' + (r % 10); r /= 10;
+        temp[count++] = '0' + (r % 10); r /= 10;
+        temp[count++] = '0' + (r % 10); r /= 10;
+        temp[count++] = '0' + r;
+
+        value = q;  // Continue with quotient
     }
 
-    // Write digits in reverse (right to left)
-    for (int i = num_digits - 1; i >= 0; i--) {
-        buffer[i] = '0' + (value % 10);
+    // Handle remaining digits (< 10000) using standard division
+    while (value > 0) {
+        temp[count++] = '0' + (value % 10);
         value /= 10;
     }
 
-    return num_digits;
+    // Reverse digits into output buffer (stored in reverse in temp)
+    for (int i = 0; i < count; i++) {
+        buffer[i] = temp[count - 1 - i];
+    }
+
+    return count;
 }
 
 // Device function: Count trailing zero bits in a 160-bit SHA1 hash
@@ -67,6 +85,7 @@ __device__ unsigned char count_trailing_zero_bits(const unsigned int* hash) {
 }
 
 // Device function: Perform SHA1 hash on a single block (64 bytes) with custom initial hash
+// Optimized to reduce register pressure by computing w[] on-the-fly
 __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned int* hash_out, const unsigned int* init_hash) {
     // Use provided initial hash values (or SHA1 default if this is the first block)
     unsigned int h0 = init_hash[0];
@@ -75,25 +94,29 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
     unsigned int h3 = init_hash[3];
     unsigned int h4 = init_hash[4];
 
-    // Expand to 80 words
-    unsigned int w[80];
+    // Only store first 16 words to save registers (was 80, now 16)
+    // w[] values for rounds 16-79 are computed on-the-fly and reuse the array
+    // This trades extra computation for reduced register pressure on GPU
+    unsigned int w[16];
     for (int i = 0; i < 16; i++) {
         w[i] = block[i];
-    }
-    for (int i = 16; i < 80; i++) {
-        w[i] = ROTLEFT((w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]), 1);
     }
 
     // Main loop (80 rounds) - unrolled into 4 loops to eliminate branches
     unsigned int a = h0, b = h1, c = h2, d = h3, e = h4;
-    unsigned int f, k, temp;
+    unsigned int f, temp;
 
     // Rounds 0-19: f = (b & c) | ((~b) & d), k = 0x5A827999
-    k = 0x5A827999;
     #pragma unroll
     for (int i = 0; i < 20; i++) {
+        // Compute w[i] on-the-fly: for i < 16 use stored value, else compute expansion
+        // Use modulo 16 indexing to reuse the w[] array as a circular buffer
+        unsigned int wi = (i < 16) ? w[i] :
+            ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
+        if (i >= 16) w[i&15] = wi;  // Store computed value back into circular buffer
+
         f = (b & c) | ((~b) & d);
-        temp = ROTLEFT(a, 5) + f + e + k + w[i];
+        temp = ROTLEFT(a, 5) + f + e + 0x5A827999 + wi;
         e = d;
         d = c;
         c = ROTLEFT(b, 30);
@@ -102,11 +125,14 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
     }
 
     // Rounds 20-39: f = b ^ c ^ d, k = 0x6ED9EBA1
-    k = 0x6ED9EBA1;
     #pragma unroll
     for (int i = 20; i < 40; i++) {
+        // Inline w[] expansion with circular buffer indexing
+        unsigned int wi = ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
+        w[i&15] = wi;
+
         f = b ^ c ^ d;
-        temp = ROTLEFT(a, 5) + f + e + k + w[i];
+        temp = ROTLEFT(a, 5) + f + e + 0x6ED9EBA1 + wi;
         e = d;
         d = c;
         c = ROTLEFT(b, 30);
@@ -115,11 +141,14 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
     }
 
     // Rounds 40-59: f = (b & c) | (b & d) | (c & d), k = 0x8F1BBCDC
-    k = 0x8F1BBCDC;
     #pragma unroll
     for (int i = 40; i < 60; i++) {
+        // Inline w[] expansion with circular buffer indexing
+        unsigned int wi = ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
+        w[i&15] = wi;
+
         f = (b & c) | (b & d) | (c & d);
-        temp = ROTLEFT(a, 5) + f + e + k + w[i];
+        temp = ROTLEFT(a, 5) + f + e + 0x8F1BBCDC + wi;
         e = d;
         d = c;
         c = ROTLEFT(b, 30);
@@ -128,11 +157,14 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
     }
 
     // Rounds 60-79: f = b ^ c ^ d, k = 0xCA62C1D6
-    k = 0xCA62C1D6;
     #pragma unroll
     for (int i = 60; i < 80; i++) {
+        // Inline w[] expansion with circular buffer indexing
+        unsigned int wi = ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
+        w[i&15] = wi;
+
         f = b ^ c ^ d;
-        temp = ROTLEFT(a, 5) + f + e + k + w[i];
+        temp = ROTLEFT(a, 5) + f + e + 0xCA62C1D6 + wi;
         e = d;
         d = c;
         c = ROTLEFT(b, 30);
@@ -157,6 +189,18 @@ extern "C" __global__ void sha1_security_level_optimized(
     int num_counters,                  // Number of counters to process
     unsigned char* security_levels     // Output: security level for each counter
 ) {
+    // Load public key into shared memory (fast L1 cache)
+    // Shared memory is per-block and much faster than global device memory
+    __shared__ unsigned char s_public_key[128];
+
+    // Cooperative load: each thread in the block loads one byte at a time
+    // This efficiently utilizes memory bandwidth and ensures coalesced access
+    for (int i = threadIdx.x; i < public_key_len; i += blockDim.x) {
+        s_public_key[i] = public_key[i];
+    }
+    // Synchronize to ensure all threads have completed loading before proceeding
+    __syncthreads();
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_counters) return;
 
@@ -167,9 +211,10 @@ extern "C" __global__ void sha1_security_level_optimized(
     unsigned char message[128];  // Reduced stack: 108 (key) + 20 (max counter) = 128
     int msg_len = 0;
 
-    // Copy public key from device memory
+    // Copy public key from shared memory (much faster than device memory!)
+    // Each thread reads from the cached copy instead of global memory
     for (int i = 0; i < public_key_len; i++) {
-        message[msg_len++] = public_key[i];
+        message[msg_len++] = s_public_key[i];
     }
 
     // Convert counter to string and append
