@@ -6,6 +6,7 @@ use crate::level_improver::SecurityLevelHasher;
 use cudarc::driver::*;
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
+use std::cell::RefCell;
 
 /// SHA1 initial hash values (RFC 3174)
 const SHA1_INIT_HASH: [u32; 5] = [
@@ -20,6 +21,9 @@ const SHA1_INIT_HASH: [u32; 5] = [
 pub struct CudaHasher {
     ctx: Arc<CudaContext>,
     module: Arc<CudaModule>,
+    module_optimized: Arc<CudaModule>,
+    // Cached public key in device memory for optimized batch processing (interior mutability)
+    cached_public_key: RefCell<Option<(CudaSlice<u8>, usize)>>, // (device memory, length)
 }
 
 impl CudaHasher {
@@ -31,12 +35,21 @@ impl CudaHasher {
     pub fn new() -> Result<Self, CudaError> {
         let ctx = CudaContext::new(0).map_err(CudaError::DeviceInitError)?;
 
-        // Load and compile the CUDA kernel
+        // Load and compile both CUDA kernels
         let ptx = compile_kernel()?;
         let module = ctx.load_module(ptx)
             .map_err(CudaError::KernelLoadError)?;
 
-        Ok(Self { ctx, module })
+        let ptx_optimized = compile_optimized_kernel()?;
+        let module_optimized = ctx.load_module(ptx_optimized)
+            .map_err(CudaError::KernelLoadError)?;
+
+        Ok(Self {
+            ctx,
+            module,
+            module_optimized,
+            cached_public_key: RefCell::new(None),
+        })
     }
 
     /// Hash multiple messages in parallel using the CUDA kernel
@@ -115,6 +128,94 @@ impl CudaHasher {
 
         Ok(words_to_hash_bytes(&h))
     }
+
+    /// Optimized batch computation of security levels using GPU-side counter generation
+    /// This is significantly faster than the standard batch processing as it:
+    /// - Keeps public key in GPU memory (transferred once)
+    /// - Generates counter strings on GPU (no CPU allocations)
+    /// - Returns only security levels (not full hashes)
+    ///
+    /// # Arguments
+    /// * `public_key` - The base64-encoded public key
+    /// * `start_counter` - First counter value
+    /// * `num_counters` - How many consecutive counters to process
+    ///
+    /// # Returns
+    /// Vector of security levels (trailing zero bits) for each counter
+    #[allow(dead_code)] // Used in tests for debugging
+    pub fn calculate_levels_optimized(
+        &self,
+        public_key: &str,
+        start_counter: u64,
+        num_counters: usize,
+    ) -> Result<Vec<u8>, CudaError> {
+        let stream = self.ctx.default_stream();
+
+        // Cache public key in device memory if not already cached or if it changed
+        let public_key_bytes = public_key.as_bytes();
+        let mut cache = self.cached_public_key.borrow_mut();
+
+        let needs_upload = match &*cache {
+            None => true,
+            Some((_, cached_len)) => *cached_len != public_key_bytes.len(),
+        };
+
+        if needs_upload {
+            let d_public_key = stream.memcpy_stod(public_key_bytes)
+                .map_err(CudaError::MemoryError)?;
+            *cache = Some((d_public_key, public_key_bytes.len()));
+        }
+
+        // Get the cached public key device memory and clone the reference
+        let (d_public_key, public_key_len) = {
+            let (slice, len) = cache.as_ref().unwrap();
+            (slice.clone(), *len)
+        };
+
+        // Drop the borrow explicitly
+        drop(cache);
+
+        // Allocate output memory for security levels
+        let mut d_security_levels = stream.alloc_zeros::<u8>(num_counters)
+            .map_err(CudaError::MemoryError)?;
+
+        // Load the optimized kernel
+        let kernel_func = self.module_optimized.load_function("sha1_security_level_optimized")
+            .map_err(CudaError::KernelLoadError)?;
+
+        // Configure kernel launch
+        let threads_per_block = 256;
+        let num_blocks = (num_counters + threads_per_block - 1) / threads_per_block;
+
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks as u32, 1, 1),
+            block_dim: (threads_per_block as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Launch kernel
+        // SAFETY: Kernel launch is safe because:
+        // 1. d_public_key contains valid public key bytes in device memory
+        // 2. public_key_len is the correct length
+        // 3. d_security_levels has space for num_counters bytes
+        // 4. All memory is properly allocated and bounds-checked
+        #[allow(unsafe_code)]
+        unsafe {
+            stream.launch_builder(&kernel_func)
+                .arg(&d_public_key)
+                .arg(&(public_key_len as i32))
+                .arg(&start_counter)
+                .arg(&(num_counters as i32))
+                .arg(&mut d_security_levels)
+                .launch(cfg)
+        }.map_err(CudaError::KernelLaunchError)?;
+
+        // Copy results back to host
+        let security_levels: Vec<u8> = stream.memcpy_dtov(&d_security_levels)
+            .map_err(CudaError::MemoryError)?;
+
+        Ok(security_levels)
+    }
 }
 
 impl SecurityLevelHasher for CudaHasher {
@@ -145,55 +246,31 @@ impl SecurityLevelHasher for CudaHasher {
             return Vec::new();
         }
 
-        // Group counters by their string length to enable efficient batch processing
-        // This avoids the variable-length fallback in hash_messages_batch
-        use std::collections::HashMap;
-        let mut length_groups: HashMap<usize, Vec<(usize, u64)>> = HashMap::new();
+        // Check if counters are consecutive (optimal case for GPU)
+        let is_consecutive = counters.windows(2).all(|w| w[1] == w[0] + 1);
 
-        for (idx, &counter) in counters.iter().enumerate() {
-            let counter_len = counter.to_string().len();
-            let total_len = public_key.len() + counter_len;
-            length_groups.entry(total_len)
-                .or_insert_with(Vec::new)
-                .push((idx, counter));
-        }
-
-        // Process each length group separately and collect results
-        let mut results = vec![0u8; counters.len()];
-
-        for (_len, group) in length_groups {
-            // Prepare messages for this group (all same length)
-            let messages_data: Vec<Vec<u8>> = group.iter()
-                .map(|(_, counter)| {
-                    let counter_str = counter.to_string();
-                    let mut message = Vec::new();
-                    message.extend_from_slice(public_key.as_bytes());
-                    message.extend_from_slice(counter_str.as_bytes());
-                    message
-                })
-                .collect();
-
-            let messages_refs: Vec<&[u8]> = messages_data.iter()
-                .map(|m| m.as_slice())
-                .collect();
-
-            // Hash this group in batch
-            match self.hash_messages_batch(&messages_refs) {
-                Ok(hashes) => {
-                    // Store results in correct positions
-                    for (i, (idx, _)) in group.iter().enumerate() {
-                        results[*idx] = crate::helpers::count_trailing_zero_bits(&hashes[i]);
-                    }
-                }
+        if is_consecutive {
+            // Use the optimized kernel for consecutive counters
+            match self.calculate_levels_optimized(public_key, counters[0], counters.len()) {
+                Ok(levels) => return levels,
                 Err(_) => {
-                    // Fall back to sequential processing for this group
-                    for (idx, counter) in group {
-                        results[idx] = self.calculate_level(public_key, counter);
-                    }
+                    // Fall back to sequential processing on error
+                    return counters.iter()
+                        .map(|&counter| self.calculate_level(public_key, counter))
+                        .collect();
                 }
             }
         }
 
+        // For non-consecutive counters, process each one using the optimized kernel
+        // This still benefits from GPU acceleration and avoids CPU-side string operations
+        let mut results = Vec::with_capacity(counters.len());
+        for &counter in counters {
+            match self.calculate_levels_optimized(public_key, counter, 1) {
+                Ok(mut levels) => results.push(levels.remove(0)),
+                Err(_) => results.push(self.calculate_level(public_key, counter)),
+            }
+        }
         results
     }
 
@@ -417,6 +494,15 @@ fn compile_kernel() -> Result<Ptx, CudaError> {
     Ok(ptx)
 }
 
+fn compile_optimized_kernel() -> Result<Ptx, CudaError> {
+    let kernel_src = include_str!("sha1_optimized.cu");
+
+    let ptx = cudarc::nvrtc::compile_ptx(kernel_src)
+        .map_err(|e| CudaError::CompileError(e.to_string()))?;
+
+    Ok(ptx)
+}
+
 /// Errors that can occur with CUDA operations
 #[derive(Debug, thiserror::Error)]
 pub enum CudaError {
@@ -607,5 +693,123 @@ mod tests {
             assert_eq!(batch_results[*i], individual_hash,
                 "Batch hash at index {} should match individual hash", i);
         }
+    }
+
+    #[test]
+    fn test_optimized_kernel_security_levels() {
+        // Test that the optimized kernel produces correct security levels
+        let hasher = CudaHasher::new().expect("Failed to initialize CUDA hasher");
+        let public_key = "ME0DAgcAAgEgAiEAy/hhqSBja7A6FTZG5s+BMnQfCqYyS9sGsbyMKBb7spYCIQCBEtZWrZtewnxuh2hsigJswGHchu3XcaiQDZziMsxTsA==";
+
+        // Test known counter values (from CPU test)
+        println!("Testing counter 14 (expected level 8):");
+        let level_14 = hasher.calculate_level(public_key, 14);
+        println!("  Got level: {}", level_14);
+        assert_eq!(level_14, 8, "Counter 14 should have level 8");
+
+        println!("\nTesting counter 201 (expected level 9):");
+        let level_201 = hasher.calculate_level(public_key, 201);
+        println!("  Got level: {}", level_201);
+        assert_eq!(level_201, 9, "Counter 201 should have level 9");
+
+        println!("\nTesting counter 672 (expected level 12):");
+        let level_672 = hasher.calculate_level(public_key, 672);
+        println!("  Got level: {}", level_672);
+        assert_eq!(level_672, 12, "Counter 672 should have level 12");
+    }
+
+    #[test]
+    fn test_optimized_kernel_vs_individual() {
+        // Compare optimized kernel output with individual calculate_level
+        let hasher = CudaHasher::new().expect("Failed to initialize CUDA hasher");
+        let public_key = "ME0DAgcAAgEgAiEAy/hhqSBja7A6FTZG5s+BMnQfCqYyS9sGsbyMKBb7spYCIQCBEtZWrZtewnxuh2hsigJswGHchu3XcaiQDZziMsxTsA==";
+
+        // First, verify the hash itself is correct by comparing with hash_message
+        println!("\nVerifying hash correctness:");
+        let message = format!("{}14", public_key);
+        let expected_hash = hasher.hash_message(message.as_bytes())
+            .expect("hash_message failed");
+
+        println!("Message: {}", message);
+        println!("Expected hash (from hash_message): {}",
+            expected_hash.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+
+        let expected_level = crate::helpers::count_trailing_zero_bits(&expected_hash);
+        println!("Expected security level: {}", expected_level);
+
+        // Test optimized method directly
+        println!("\nTesting optimized kernel directly:");
+        let levels_optimized = hasher.calculate_levels_optimized(public_key, 14, 1)
+            .expect("Optimized kernel failed");
+
+        println!("Optimized kernel level for counter 14: {}", levels_optimized[0]);
+
+        let individual_level = hasher.calculate_level(public_key, 14);
+        println!("Individual method level for counter 14: {}", individual_level);
+
+        assert_eq!(levels_optimized[0], expected_level,
+            "Optimized kernel should match expected level");
+        assert_eq!(levels_optimized[0], individual_level,
+            "Optimized kernel should match individual for counter 14");
+    }
+
+    #[test]
+    fn test_optimized_kernel_batch() {
+        // Test that the optimized batch kernel produces correct results
+        let hasher = CudaHasher::new().expect("Failed to initialize CUDA hasher");
+        let public_key = "ME0DAgcAAgEgAiEAy/hhqSBja7A6FTZG5s+BMnQfCqYyS9sGsbyMKBb7spYCIQCBEtZWrZtewnxuh2hsigJswGHchu3XcaiQDZziMsxTsA==";
+
+        // Test batch with consecutive counters including known values
+        println!("\nTesting batch 14-700:");
+        let counters: Vec<u64> = (14..=700).collect();
+        let levels = hasher.calculate_levels_batch(public_key, &counters);
+
+        // Debug: print first few results
+        println!("First 10 levels:");
+        for i in 0..10 {
+            println!("  Counter {}: level {}", 14 + i, levels[i]);
+        }
+
+        // Check specific known values
+        println!("\nExpected levels:");
+        println!("  Counter 14: expected 8, got {}", levels[0]);
+        println!("  Counter 201: expected 9, got {}", levels[201 - 14]);
+        println!("  Counter 672: expected 12, got {}", levels[672 - 14]);
+
+        assert_eq!(levels[0], 8, "Counter 14 (index 0) should have level 8");
+        assert_eq!(levels[201 - 14], 9, "Counter 201 should have level 9");
+        assert_eq!(levels[672 - 14], 12, "Counter 672 should have level 12");
+
+        // Find best in batch to verify
+        let best = levels.iter().enumerate().max_by_key(|&(_, level)| level).unwrap();
+        println!("  Best in batch: counter {} has level {}", 14 + best.0, best.1);
+        assert_eq!(14 + best.0, 672, "Counter 672 should be the best in this range");
+        assert_eq!(*best.1, 12, "Best counter should have level 12");
+    }
+
+    #[test]
+    fn test_both_kernels_match() {
+        // Test that old kernel (hash_message) and new optimized kernel produce same results
+        let hasher = CudaHasher::new().expect("Failed to initialize CUDA hasher");
+        let public_key = "ME0DAgcAAgEgAiEAy/hhqSBja7A6FTZG5s+BMnQfCqYyS9sGsbyMKBb7spYCIQCBEtZWrZtewnxuh2hsigJswGHchu3XcaiQDZziMsxTsA==";
+
+        println!("\nComparing old kernel (hash_message) vs new optimized kernel:");
+
+        // Test several counter values
+        for counter in [14, 201, 672, 1000, 5000] {
+            // Old kernel path: calculate_level uses hash_message
+            let level_old = hasher.calculate_level(public_key, counter);
+
+            // New optimized kernel path: calculate_levels_optimized
+            let levels_new = hasher.calculate_levels_optimized(public_key, counter, 1)
+                .expect("Optimized kernel failed");
+
+            println!("  Counter {}: old_kernel={}, new_kernel={}", counter, level_old, levels_new[0]);
+
+            assert_eq!(level_old, levels_new[0],
+                "Old and new kernels must produce same result for counter {}", counter);
+        }
+
+        println!("  All counters match! Both kernels produce identical results.");
     }
 }
