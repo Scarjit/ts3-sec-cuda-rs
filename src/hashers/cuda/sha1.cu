@@ -3,19 +3,20 @@
 #define ROTLEFT(a,b) (((a) << (b)) | ((a) >> (32-(b))))
 
 extern "C" __global__ void sha1_simple(
-    const unsigned int* inputs,  // Input data (16 words per hash)
-    unsigned int* outputs,        // Output hashes (5 words per hash)
-    int num_hashes
+    const unsigned int* inputs,    // Input data (16 words per hash)
+    unsigned int* outputs,          // Output hashes (5 words per hash)
+    int num_hashes,
+    const unsigned int* init_hash  // Initial hash values (5 words)
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_hashes) return;
 
-    // SHA1 initial hash values
-    unsigned int h0 = 0x67452301;
-    unsigned int h1 = 0xEFCDAB89;
-    unsigned int h2 = 0x98BADCFE;
-    unsigned int h3 = 0x10325476;
-    unsigned int h4 = 0xC3D2E1F0;
+    // SHA1 initial hash values from parameter
+    unsigned int h0 = init_hash[0];
+    unsigned int h1 = init_hash[1];
+    unsigned int h2 = init_hash[2];
+    unsigned int h3 = init_hash[3];
+    unsigned int h4 = init_hash[4];
 
     // Get input block for this thread (16 words = 64 bytes)
     const unsigned int* block = &inputs[idx * 16];
