@@ -1,0 +1,16 @@
+[package]
+name = "ts3-sec-cuda-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ini = { package = "rust-ini", version = "0.21" }
+thiserror = "2.0"
+tsproto-types = { git = "https://github.com/ReSpeak/tsclientlib.git", rev = "3fbfa26ead0d3e5b38288b55abe3e2d636a97115" }
+sha1 = "0.10"
+ctrlc = "3.4"
+clap = { version = "4.5", features = ["derive"] }
+
+[[bin]]
+name = "ts3-sec-cuda-rs"
+path = "src/main.rs"
