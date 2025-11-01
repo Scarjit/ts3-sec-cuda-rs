@@ -13,6 +13,7 @@ use thiserror::Error;
 use ini::Ini;
 use tsproto_types::crypto::EccKeyPrivP256;
 use sha1::{Digest, Sha1};
+use crate::helpers::count_trailing_zero_bits;
 
 #[derive(Debug, Error)]
 pub enum IdentityError {
@@ -48,14 +49,6 @@ impl Ts3Identity {
     /// Parse a TeamSpeak 3 identity.ini file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, IdentityError> {
         let conf = Ini::load_from_file(path)
-            .map_err(|e| IdentityError::IniError(e.to_string()))?;
-
-        Self::from_ini(conf)
-    }
-
-    /// Parse a TeamSpeak 3 identity from INI string content
-    pub fn from_ini_str(ini_content: &str) -> Result<Self, IdentityError> {
-        let conf = Ini::load_from_str(ini_content)
             .map_err(|e| IdentityError::IniError(e.to_string()))?;
 
         Self::from_ini(conf)
@@ -112,11 +105,6 @@ impl Ts3Identity {
         })
     }
 
-    /// Get the private key as a base64-encoded TS string
-    pub fn private_key_base64(&self) -> String {
-        self.private_key.to_ts()
-    }
-
     /// Get the public key (omega) as a base64-encoded TS string
     pub fn public_key_base64(&self) -> String {
         self.private_key.to_pub().to_ts()
@@ -135,20 +123,6 @@ impl Ts3Identity {
 
         count_trailing_zero_bits(&hash)
     }
-}
-
-/// Count trailing zero bits in a byte array
-fn count_trailing_zero_bits(hash: &[u8]) -> u8 {
-    let mut count = 0;
-    for &byte in hash {
-        if byte == 0 {
-            count += 8;
-        } else {
-            count += byte.trailing_zeros() as u8;
-            break;
-        }
-    }
-    count
 }
 
 #[cfg(test)]
@@ -196,7 +170,8 @@ identity=\"1118470V0W/upAdIHOOe56XP5QOtgKfSBs9bAXwCVVUYRzFEBE0gHFcFXkJODQJ1LwBXU
 nickname=TeamSpeakUser
 phonetic_nickname=
 ";
-        let result = Ts3Identity::from_ini_str(config);
+        let conf = Ini::load_from_str(config).unwrap();
+        let result = Ts3Identity::from_ini(conf);
         assert!(result.is_ok(), "Result should be ok, is: {:?}", result);
 
         let identity = result.unwrap();
@@ -206,30 +181,13 @@ phonetic_nickname=
     #[test]
     fn test_security_level() {
         let config = "[Identity]\nidentity=\"1118470V0W/upAdIHOOe56XP5QOtgKfSBs9bAXwCVVUYRzFEBE0gHFcFXkJODQJ1LwBXUl8IDGNLB1dzfjM9ZH0GVFlFY0MeaFZNE04FGBUeUiM1EAd+BF1ZXF4YWlAwBlJkCH8DU3NCdUhLOENJUUNQd3ZWYzVzOUx3aGxaSk0yTUk0djUzSkw5Ykp5ekoyVU0wNFVWZkNQUUlRPT0=\"";
-        let identity = Ts3Identity::from_ini_str(config).unwrap();
+        let conf = Ini::load_from_str(config).unwrap();
+        let identity = Ts3Identity::from_ini(conf).unwrap();
 
         let level = identity.security_level();
         println!("Security level for counter {}: {}", identity.counter, level);
 
         // The security level should be at least 16 (typically identities aim for level 20+)
         assert!(level >= 16, "Security level should be at least 16, got {}", level);
-    }
-
-    #[test]
-    fn test_count_trailing_zero_bits() {
-        // Test with all zeros
-        assert_eq!(count_trailing_zero_bits(&[0, 0, 0, 0]), 32);
-
-        // Test with one byte = 0x01 (binary: 00000001) -> 0 trailing zeros
-        assert_eq!(count_trailing_zero_bits(&[0x01]), 0);
-
-        // Test with one byte = 0x02 (binary: 00000010) -> 1 trailing zero
-        assert_eq!(count_trailing_zero_bits(&[0x02]), 1);
-
-        // Test with one byte = 0x04 (binary: 00000100) -> 2 trailing zeros
-        assert_eq!(count_trailing_zero_bits(&[0x04]), 2);
-
-        // Test with first byte zero, second byte = 0x08 (binary: 00001000) -> 8 + 3 = 11 trailing zeros
-        assert_eq!(count_trailing_zero_bits(&[0x00, 0x08]), 11);
     }
 }

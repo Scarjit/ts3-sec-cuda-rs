@@ -10,6 +10,8 @@ tsproto-types = { git = "https://github.com/ReSpeak/tsclientlib.git", rev = "3fb
 sha1 = "0.10"
 ctrlc = "3.4"
 clap = { version = "4.5", features = ["derive"] }
+cudarc = { version = "0.17.6", features = ["cuda-13000"] }
+
 
 [[bin]]
 name = "ts3-sec-cuda-rs"

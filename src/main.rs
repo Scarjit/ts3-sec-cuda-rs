@@ -1,60 +1,18 @@
-#[deny(unsafe_code)]
+#[deny(unsafe_code,unused)]
 mod identity;
 mod level_improver;
+mod hashers;
+mod helpers;
+mod cli;
 
 use identity::Ts3Identity;
-use level_improver::{LevelImprover, CpuHasher, SecurityLevelHasher};
-use clap::{Parser, Subcommand, ValueEnum};
+use level_improver::{LevelImprover, SecurityLevelHasher};
+use hashers::{CpuHasher, CudaHasher};
+use helpers::{print_statistics, format_number};
+use cli::{Cli, Command, HasherMethod};
+use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
-#[derive(Parser)]
-#[command(name = "ts3-sec-cuda-rs")]
-#[command(about = "TeamSpeak 3 Security Level Tool", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Decode and display identity information
-    Decode {
-        /// Path to identity.ini file
-        #[arg(short, long, group = "input")]
-        file: Option<String>,
-
-        /// Identity string directly (format: "counter" + "V" + base64_key)
-        #[arg(short, long, group = "input")]
-        string: Option<String>,
-    },
-    /// Increase security level of an identity
-    Increase {
-        /// Path to identity.ini file
-        #[arg(short, long, group = "input")]
-        file: Option<String>,
-
-        /// Identity string directly (format: "counter" + "V" + base64_key)
-        #[arg(short, long, group = "input")]
-        string: Option<String>,
-
-        /// Target security level to reach
-        #[arg(short, long)]
-        target: u8,
-
-        /// Hasher method to use
-        #[arg(short = 'm', long, value_enum, default_value_t = HasherMethod::Cpu)]
-        method: HasherMethod,
-    },
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum HasherMethod {
-    /// CPU-based SHA-1 hashing
-    Cpu,
-    // Future: GPU-based hashing
-    // Gpu,
-}
 
 fn main() {
     let cli = Cli::parse();
@@ -158,7 +116,24 @@ fn increase_level(file: Option<String>, string: Option<String>, target_level: u8
                 run_improver_string(&identity_str, target_level, CpuHasher);
             }
         }
-        // Future GPU implementation would go here
+        HasherMethod::Cuda => {
+            println!("⚙️  Method: CUDA\n");
+            match CudaHasher::new() {
+                Ok(cuda_hasher) => {
+                    if let Some(file_path) = file {
+                        run_improver_file(&file_path, target_level, cuda_hasher);
+                    } else if let Some(identity_str) = string {
+                        run_improver_string(&identity_str, target_level, cuda_hasher);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ CUDA Error: {}", e);
+                    eprintln!("   CUDA support is not yet implemented.");
+                    eprintln!("   Please use --method cpu for now.");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
@@ -208,14 +183,7 @@ fn run_improver_file<H: SecurityLevelHasher>(
 
     // Display final statistics
     let stats = improver.get_statistics();
-    println!("\n📊 Statistics:");
-    println!("   Total hashes checked: {}", format_number(stats.hashes_checked));
-    println!("   Average hashrate: {:.2} MH/s", stats.avg_hashrate / 1_000_000.0);
-    if stats.elapsed_secs < 1.0 {
-        println!("   Time elapsed: {:.3}s", stats.elapsed_secs);
-    } else {
-        println!("   Time elapsed: {:.1}s", stats.elapsed_secs);
-    }
+    print_statistics(stats.hashes_checked, stats.elapsed_secs);
 }
 
 fn run_improver_string<H: SecurityLevelHasher>(
@@ -282,16 +250,7 @@ fn run_improver_string<H: SecurityLevelHasher>(
 
         // Print progress every second
         if last_print.elapsed() >= Duration::from_secs(1) {
-            let elapsed = start_time.elapsed();
-            let hashes_per_sec = hashes_checked as f64 / elapsed.as_secs_f64();
-
-            print!("\r[Level {}] Counter: {} | {:.0} H/s | {} hashes checked",
-                   best_level,
-                   current_counter,
-                   hashes_per_sec,
-                   format_number(hashes_checked));
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-
+            helpers::print_progress(best_level, current_counter, hashes_checked, start_time);
             last_print = Instant::now();
         }
     }
@@ -306,31 +265,5 @@ fn run_improver_string<H: SecurityLevelHasher>(
 
     // Display final statistics
     let elapsed_secs = start_time.elapsed().as_secs_f64();
-    let avg_hashrate = if elapsed_secs > 0.0 {
-        hashes_checked as f64 / elapsed_secs
-    } else {
-        0.0
-    };
-
-    println!("\n📊 Statistics:");
-    println!("   Total hashes checked: {}", format_number(hashes_checked));
-    println!("   Average hashrate: {:.2} MH/s", avg_hashrate / 1_000_000.0);
-    if elapsed_secs < 1.0 {
-        println!("   Time elapsed: {:.3}s", elapsed_secs);
-    } else {
-        println!("   Time elapsed: {:.1}s", elapsed_secs);
-    }
-}
-
-/// Format a number with thousand separators
-fn format_number(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
+    print_statistics(hashes_checked, elapsed_secs);
 }

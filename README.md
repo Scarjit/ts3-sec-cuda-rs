@@ -1,6 +1,6 @@
 # ts3-sec-cuda-rs
 
-TeamSpeak 3 Security Level Tool - A Rust implementation for parsing and improving TS3 identity security levels using CPU-based SHA-1 hashing.
+TeamSpeak 3 Security Level Tool - A Rust implementation for parsing and improving TS3 identity security levels using SHA-1 hashing.
 
 ## Overview
 

@@ -5,9 +5,9 @@
 
 use std::path::Path;
 use std::time::{Duration, Instant};
-use sha1::{Digest, Sha1};
 use ini::Ini;
 use crate::identity::{Ts3Identity, IdentityError};
+use crate::helpers;
 
 const BATCH_SIZE: u64 = 10_000; // Check this many counters before printing progress
 
@@ -18,24 +18,6 @@ pub trait SecurityLevelHasher {
 
     /// Get the name of this hasher (for display purposes)
     fn name(&self) -> &str;
-}
-
-/// CPU-based hasher using sha1 crate
-pub struct CpuHasher;
-
-impl SecurityLevelHasher for CpuHasher {
-    fn calculate_level(&self, public_key: &str, counter: u64) -> u8 {
-        let mut hasher = Sha1::new();
-        hasher.update(public_key.as_bytes());
-        hasher.update(counter.to_string().as_bytes());
-        let hash = hasher.finalize();
-
-        count_trailing_zero_bits(&hash)
-    }
-
-    fn name(&self) -> &str {
-        "CPU"
-    }
 }
 
 /// Result of a level improvement search
@@ -50,7 +32,6 @@ pub struct LevelSearchResult {
 pub struct ImprovementStatistics {
     pub hashes_checked: u64,
     pub elapsed_secs: f64,
-    pub avg_hashrate: f64,
 }
 
 /// Improve the security level of an identity by searching for better counter values
@@ -133,16 +114,10 @@ impl<H: SecurityLevelHasher> LevelImprover<H> {
     pub fn get_statistics(&self) -> ImprovementStatistics {
         let elapsed = self.start_time.elapsed();
         let elapsed_secs = elapsed.as_secs_f64();
-        let avg_hashrate = if elapsed_secs > 0.0 {
-            self.hashes_checked as f64 / elapsed_secs
-        } else {
-            0.0
-        };
 
         ImprovementStatistics {
             hashes_checked: self.hashes_checked,
             elapsed_secs,
-            avg_hashrate,
         }
     }
 
@@ -273,16 +248,7 @@ impl<H: SecurityLevelHasher> LevelImprover<H> {
 
             // Print progress every second
             if last_print.elapsed() >= Duration::from_secs(1) {
-                let elapsed = self.start_time.elapsed();
-                let hashes_per_sec = self.hashes_checked as f64 / elapsed.as_secs_f64();
-
-                print!("\r[Level {}] Counter: {} | {:.0} H/s | {} hashes checked",
-                       self.best_level,
-                       self.current_counter,
-                       hashes_per_sec,
-                       format_number(self.hashes_checked));
-                std::io::Write::flush(&mut std::io::stdout()).ok();
-
+                helpers::print_progress(self.best_level, self.current_counter, self.hashes_checked, self.start_time);
                 last_print = Instant::now();
             }
 
@@ -292,50 +258,3 @@ impl<H: SecurityLevelHasher> LevelImprover<H> {
     }
 }
 
-/// Count trailing zero bits in a byte array
-fn count_trailing_zero_bits(hash: &[u8]) -> u8 {
-    let mut count = 0;
-    for &byte in hash {
-        if byte == 0 {
-            count += 8;
-        } else {
-            count += byte.trailing_zeros() as u8;
-            break;
-        }
-    }
-    count
-}
-
-/// Format a number with thousand separators
-fn format_number(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_count_trailing_zero_bits() {
-        assert_eq!(count_trailing_zero_bits(&[0, 0, 0, 0]), 32);
-        assert_eq!(count_trailing_zero_bits(&[0x01]), 0);
-        assert_eq!(count_trailing_zero_bits(&[0x02]), 1);
-        assert_eq!(count_trailing_zero_bits(&[0x04]), 2);
-        assert_eq!(count_trailing_zero_bits(&[0x00, 0x08]), 11);
-    }
-
-    #[test]
-    fn test_format_number() {
-        assert_eq!(format_number(1234567), "1,234,567");
-        assert_eq!(format_number(42), "42");
-        assert_eq!(format_number(1000), "1,000");
-    }
-}
