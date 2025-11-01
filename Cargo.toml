@@ -2,6 +2,12 @@
 name = "ts3-sec-cuda-rs"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["scarjit"]
+description = "GPU-accelerated TeamSpeak 3 identity security level tool using CUDA"
+repository = "https://github.com/scarjit/ts3-sec-cuda-rs"
+keywords = ["teamspeak", "cuda", "gpu", "sha1", "security"]
+categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]
 ini = { package = "rust-ini", version = "0.21" }

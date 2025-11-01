@@ -131,3 +131,7 @@ make nvcc-check   # Check CUDA stack usage (80 bytes)
 **Identity Format:** `COUNTER || 'V' || base64(obfuscate(base64(KEYPAIR_ASN1)))`
 **Security Level:** Trailing zero bits in `SHA-1(public_key || counter)`
 **Key Type:** P-256 ECC (secp256r1)
+
+## License
+
+MIT License - see [LICENSE](LICENSE) file for details.
