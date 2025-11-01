@@ -1,9 +1,9 @@
-// sha1_optimized.cu
-// Optimized CUDA kernel for TS3 security level calculation
-// - Generates counter strings on GPU
-// - No CPU-side string allocations
-// - Directly outputs security levels (trailing zero bits)
-// - Optimized with circular buffer for reduced register pressure
+// sha1_optimized.cu - Optimized SHA1 security level calculation
+// OPTIMIZATIONS:
+// - Fast path: Single-block SHA1 for short messages (total_len <= 55 bytes)
+// - Slow path: Multi-block SHA1 using dynamic shared memory
+// - Circular buffer for w[] (16 words instead of 80, reduces register pressure)
+// - Shared memory for public key caching
 
 #define ROTLEFT(a,b) (((a) << (b)) | ((a) >> (32-(b))))
 
@@ -16,11 +16,13 @@ __device__ int u64_to_string(unsigned long long value, unsigned char* buffer) {
     }
 
     // Temporary buffer to store digits in reverse order
-    unsigned char temp[20];
+    // 16 bytes is enough for counters up to 10^16 (10 quadrillion)
+    // Max u64 needs 20 digits, but practical use cases don't exceed this
+    unsigned char temp[16];
     int count = 0;
 
     // Extract digits one by one
-    while (value > 0) {
+    while (value > 0 && count < 16) {
         temp[count++] = '0' + (value % 10);
         value /= 10;
     }
@@ -74,17 +76,16 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
     unsigned int h3 = init_hash[3];
     unsigned int h4 = init_hash[4];
 
-    // Only store first 16 words to save registers (was 80, now 16)
+    // Only store first 16 words to save registers (circular buffer)
     // w[] values for rounds 16-79 are computed on-the-fly and reuse the array
-    // This trades extra computation for reduced register pressure on GPU
     unsigned int w[16];
+    #pragma unroll
     for (int i = 0; i < 16; i++) {
         w[i] = block[i];
     }
 
-    // Main loop (80 rounds) - unrolled into 4 loops to eliminate branches
+    // SHA1 working variables
     unsigned int a = h0, b = h1, c = h2, d = h3, e = h4;
-    unsigned int f, temp;
 
     // Rounds 0-19: f = (b & c) | ((~b) & d), k = 0x5A827999
     #pragma unroll
@@ -95,13 +96,9 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
             ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
         if (i >= 16) w[i&15] = wi;  // Store computed value back into circular buffer
 
-        f = (b & c) | ((~b) & d);
-        temp = ROTLEFT(a, 5) + f + e + 0x5A827999 + wi;
-        e = d;
-        d = c;
-        c = ROTLEFT(b, 30);
-        b = a;
-        a = temp;
+        unsigned int f = (b & c) | ((~b) & d);
+        unsigned int temp = ROTLEFT(a, 5) + f + e + 0x5A827999 + wi;
+        e = d; d = c; c = ROTLEFT(b, 30); b = a; a = temp;
     }
 
     // Rounds 20-39: f = b ^ c ^ d, k = 0x6ED9EBA1
@@ -111,13 +108,9 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
         unsigned int wi = ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
         w[i&15] = wi;
 
-        f = b ^ c ^ d;
-        temp = ROTLEFT(a, 5) + f + e + 0x6ED9EBA1 + wi;
-        e = d;
-        d = c;
-        c = ROTLEFT(b, 30);
-        b = a;
-        a = temp;
+        unsigned int f = b ^ c ^ d;
+        unsigned int temp = ROTLEFT(a, 5) + f + e + 0x6ED9EBA1 + wi;
+        e = d; d = c; c = ROTLEFT(b, 30); b = a; a = temp;
     }
 
     // Rounds 40-59: f = (b & c) | (b & d) | (c & d), k = 0x8F1BBCDC
@@ -127,13 +120,9 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
         unsigned int wi = ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
         w[i&15] = wi;
 
-        f = (b & c) | (b & d) | (c & d);
-        temp = ROTLEFT(a, 5) + f + e + 0x8F1BBCDC + wi;
-        e = d;
-        d = c;
-        c = ROTLEFT(b, 30);
-        b = a;
-        a = temp;
+        unsigned int f = (b & c) | (b & d) | (c & d);
+        unsigned int temp = ROTLEFT(a, 5) + f + e + 0x8F1BBCDC + wi;
+        e = d; d = c; c = ROTLEFT(b, 30); b = a; a = temp;
     }
 
     // Rounds 60-79: f = b ^ c ^ d, k = 0xCA62C1D6
@@ -143,13 +132,9 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
         unsigned int wi = ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
         w[i&15] = wi;
 
-        f = b ^ c ^ d;
-        temp = ROTLEFT(a, 5) + f + e + 0xCA62C1D6 + wi;
-        e = d;
-        d = c;
-        c = ROTLEFT(b, 30);
-        b = a;
-        a = temp;
+        unsigned int f = b ^ c ^ d;
+        unsigned int temp = ROTLEFT(a, 5) + f + e + 0xCA62C1D6 + wi;
+        e = d; d = c; c = ROTLEFT(b, 30); b = a; a = temp;
     }
 
     // Add to hash values
@@ -162,10 +147,9 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
 
 // Optimized kernel: Compute security levels for a range of counters
 // Each thread handles one counter value
-// OPTIMIZATIONS:
-// - Shared memory for public key (fast L1 cache)
-// - Circular buffer for w[] in SHA1 (16 words instead of 80)
-// - Multi-block SHA1 support for large messages
+// DUAL-PATH OPTIMIZATION:
+// - Fast path: Single-block SHA1 for short messages (total_len <= 55 bytes)
+// - Slow path: Multi-block SHA1 using dynamic shared memory for longer messages
 extern "C" __global__ void sha1_security_level_optimized(
     const unsigned char* public_key,   // Public key bytes in device memory
     int public_key_len,                // Length of public key
@@ -178,7 +162,6 @@ extern "C" __global__ void sha1_security_level_optimized(
     __shared__ unsigned char s_public_key[128];
 
     // Cooperative load: each thread in the block loads one byte at a time
-    // This efficiently utilizes memory bandwidth and ensures coalesced access
     for (int i = threadIdx.x; i < public_key_len; i += blockDim.x) {
         s_public_key[i] = public_key[i];
     }
@@ -191,19 +174,157 @@ extern "C" __global__ void sha1_security_level_optimized(
     // Calculate this thread's counter value
     unsigned long long counter = start_counter + idx;
 
-    // Build message: public_key + counter_string
-    unsigned char message[128];  // Buffer for public_key + counter
-    int msg_len = 0;
+    // Convert counter to string FIRST (small 16-byte stack buffer)
+    // This allows us to determine the total message length early
+    // 16 bytes is enough for counters up to 10^16
+    unsigned char counter_str[16];
+    int counter_len = u64_to_string(counter, counter_str);
 
-    // Copy public key from shared memory (much faster than device memory!)
-    // Each thread reads from the cached copy instead of global memory
-    for (int i = 0; i < public_key_len; i++) {
-        message[msg_len++] = s_public_key[i];
+    int total_len = public_key_len + counter_len;
+
+    // ============ FAST PATH: SINGLE BLOCK ============
+    // If total message length <= 55 bytes, we can fit everything in one SHA1 block
+    // Note: Most real-world public keys are longer and will use the slow path
+    if (total_len <= 55) {
+        // Build message directly into w[] array (single allocation for both input and expansion)
+        // This eliminates the need for a separate block[] array (saves 64 bytes!)
+        unsigned int w[16];
+        for (int i = 0; i < 16; i++) w[i] = 0;
+
+        int pos = 0;
+
+        // Pack public key directly into w[] words (big-endian format)
+        for (int i = 0; i < public_key_len; i++) {
+            int word_idx = pos / 4;      // Which 32-bit word
+            int byte_idx = pos % 4;      // Which byte in that word (0-3)
+            // Shift byte to correct position (big-endian: MSB first)
+            w[word_idx] |= ((unsigned int)s_public_key[i]) << (24 - byte_idx * 8);
+            pos++;
+        }
+
+        // Pack counter string directly into w[] words
+        for (int i = 0; i < counter_len; i++) {
+            int word_idx = pos / 4;
+            int byte_idx = pos % 4;
+            w[word_idx] |= ((unsigned int)counter_str[i]) << (24 - byte_idx * 8);
+            pos++;
+        }
+
+        // Add SHA1 padding: 0x80 byte followed by zeros, then length
+        int word_idx = pos / 4;
+        int byte_idx = pos % 4;
+        w[word_idx] |= 0x80u << (24 - byte_idx * 8);  // Append 0x80 byte
+
+        // Add message length in bits at the end (words 14-15)
+        unsigned long long bit_len = (unsigned long long)total_len * 8;
+        w[14] = (unsigned int)(bit_len >> 32);  // High 32 bits
+        w[15] = (unsigned int)(bit_len & 0xFFFFFFFF);  // Low 32 bits
+
+        // Compute SHA1 hash (single block from scratch - no init_hash array needed)
+        // SHA1 initial hash values (constants)
+        unsigned int h0 = 0x67452301;
+        unsigned int h1 = 0xEFCDAB89;
+        unsigned int h2 = 0x98BADCFE;
+        unsigned int h3 = 0x10325476;
+        unsigned int h4 = 0xC3D2E1F0;
+
+        // SHA1 working variables
+        unsigned int a = h0, b = h1, c = h2, d = h3, e = h4;
+
+        // Rounds 0-19
+        #pragma unroll
+        for (int i = 0; i < 20; i++) {
+            unsigned int wi = (i < 16) ? w[i] :
+                ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
+            if (i >= 16) w[i&15] = wi;
+
+            unsigned int f = (b & c) | ((~b) & d);
+            unsigned int temp = ROTLEFT(a, 5) + f + e + 0x5A827999 + wi;
+            e = d; d = c; c = ROTLEFT(b, 30); b = a; a = temp;
+        }
+
+        // Rounds 20-39
+        #pragma unroll
+        for (int i = 20; i < 40; i++) {
+            unsigned int wi = ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
+            w[i&15] = wi;
+
+            unsigned int f = b ^ c ^ d;
+            unsigned int temp = ROTLEFT(a, 5) + f + e + 0x6ED9EBA1 + wi;
+            e = d; d = c; c = ROTLEFT(b, 30); b = a; a = temp;
+        }
+
+        // Rounds 40-59
+        #pragma unroll
+        for (int i = 40; i < 60; i++) {
+            unsigned int wi = ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
+            w[i&15] = wi;
+
+            unsigned int f = (b & c) | (b & d) | (c & d);
+            unsigned int temp = ROTLEFT(a, 5) + f + e + 0x8F1BBCDC + wi;
+            e = d; d = c; c = ROTLEFT(b, 30); b = a; a = temp;
+        }
+
+        // Rounds 60-79
+        #pragma unroll
+        for (int i = 60; i < 80; i++) {
+            unsigned int wi = ROTLEFT((w[(i-3)&15] ^ w[(i-8)&15] ^ w[(i-14)&15] ^ w[i&15]), 1);
+            w[i&15] = wi;
+
+            unsigned int f = b ^ c ^ d;
+            unsigned int temp = ROTLEFT(a, 5) + f + e + 0xCA62C1D6 + wi;
+            e = d; d = c; c = ROTLEFT(b, 30); b = a; a = temp;
+        }
+
+        // Compute final hash values
+        h0 += a;
+        h1 += b;
+        h2 += c;
+        h3 += d;
+        h4 += e;
+
+        // Count trailing zero bits inline (no hash array needed!)
+        unsigned char count = 0;
+        for (int word_idx = 0; word_idx < 5; word_idx++) {
+            unsigned int word = (word_idx == 0) ? h0 :
+                               (word_idx == 1) ? h1 :
+                               (word_idx == 2) ? h2 :
+                               (word_idx == 3) ? h3 : h4;
+
+            for (int byte_in_word = 0; byte_in_word < 4; byte_in_word++) {
+                unsigned char byte = (word >> (24 - byte_in_word * 8)) & 0xFF;
+
+                if (byte == 0) {
+                    count += 8;
+                } else {
+                    unsigned char tz = 0;
+                    while (tz < 8 && (byte & (1u << tz)) == 0) {
+                        tz++;
+                    }
+                    security_levels[idx] = count + tz;
+                    return;
+                }
+            }
+        }
+
+        security_levels[idx] = count;
+        return;  // Fast path complete!
     }
 
-    // Convert counter to string and append
-    int counter_len = u64_to_string(counter, message + msg_len);
-    msg_len += counter_len;
+    // ============ SLOW PATH: MULTI-BLOCK ============
+    // For messages > 55 bytes, use dynamic shared memory to avoid stack usage
+    // Dynamic shared memory is allocated per-block at kernel launch
+    extern __shared__ unsigned char s_message[];
+    unsigned char* my_message = &s_message[threadIdx.x * 128];
+
+    // Build message in dynamic shared memory
+    int msg_len = 0;
+    for (int i = 0; i < public_key_len; i++) {
+        my_message[msg_len++] = s_public_key[i];
+    }
+    for (int i = 0; i < counter_len; i++) {
+        my_message[msg_len++] = counter_str[i];
+    }
 
     // Multi-block SHA1 processing
     unsigned int hash[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
@@ -219,13 +340,12 @@ extern "C" __global__ void sha1_security_level_optimized(
 
         // Convert 64 bytes to 16 words (big-endian)
         for (int i = 0; i < 16; i++) {
-            block[i] = ((unsigned int)message[pos + i*4 + 0] << 24) |
-                       ((unsigned int)message[pos + i*4 + 1] << 16) |
-                       ((unsigned int)message[pos + i*4 + 2] << 8) |
-                       ((unsigned int)message[pos + i*4 + 3]);
+            block[i] = ((unsigned int)my_message[pos + i*4 + 0] << 24) |
+                       ((unsigned int)my_message[pos + i*4 + 1] << 16) |
+                       ((unsigned int)my_message[pos + i*4 + 2] << 8) |
+                       ((unsigned int)my_message[pos + i*4 + 3]);
         }
 
-        // Process this block using circular buffer optimization
         sha1_single_block_with_init(block, hash, hash);
         pos += 64;
     }
@@ -236,18 +356,14 @@ extern "C" __global__ void sha1_security_level_optimized(
 
     for (int block_num = 0; block_num < final_blocks; block_num++) {
         unsigned int block[16];
-
-        // Initialize to zero
-        for (int i = 0; i < 16; i++) {
-            block[i] = 0;
-        }
+        for (int i = 0; i < 16; i++) block[i] = 0;
 
         // Copy remaining message bytes for first final block
         if (block_num == 0) {
             for (int i = 0; i < remaining; i++) {
                 int word_idx = i / 4;
                 int byte_idx = i % 4;
-                block[word_idx] |= ((unsigned int)message[pos + i]) << (24 - byte_idx * 8);
+                block[word_idx] |= ((unsigned int)my_message[pos + i]) << (24 - byte_idx * 8);
             }
 
             // Add 0x80 byte
@@ -266,6 +382,6 @@ extern "C" __global__ void sha1_security_level_optimized(
         sha1_single_block_with_init(block, hash, hash);
     }
 
-    // Count trailing zero bits
+    // Count trailing zero bits and write result
     security_levels[idx] = count_trailing_zero_bits(hash);
 }

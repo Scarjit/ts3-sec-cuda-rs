@@ -44,6 +44,16 @@ pub enum Command {
         /// Higher values = better GPU utilization but more memory
         #[arg(short, long)]
         batch_size: Option<usize>,
+
+        /// CUDA threads per block (32, 64, 128, 256, 512, 1024) [default: 128]
+        /// 128 provides best overall performance based on benchmarks
+        #[arg(long)]
+        cuda_threads: Option<usize>,
+
+        /// CUDA dynamic shared memory in bytes [default: threads_per_block * 128]
+        /// Only needed if you want to override the automatic calculation
+        #[arg(long)]
+        cuda_shared_mem: Option<usize>,
     },
 }
 

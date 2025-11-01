@@ -22,8 +22,8 @@ fn main() {
         Command::Decode { file, string } => {
             decode_identity(file, string);
         }
-        Command::Increase { file, string, target, method, batch_size } => {
-            increase_level(file, string, target, method, batch_size);
+        Command::Increase { file, string, target, method, batch_size, cuda_threads, cuda_shared_mem } => {
+            increase_level(file, string, target, method, batch_size, cuda_threads, cuda_shared_mem);
         }
     }
 }
@@ -66,7 +66,15 @@ fn decode_identity(file: Option<String>, string: Option<String>) {
              2_f64.powi(identity.security_level() as i32));
 }
 
-fn increase_level(file: Option<String>, string: Option<String>, target_level: u8, method: HasherMethod, batch_size: Option<usize>) {
+fn increase_level(
+    file: Option<String>,
+    string: Option<String>,
+    target_level: u8,
+    method: HasherMethod,
+    batch_size: Option<usize>,
+    cuda_threads: Option<usize>,
+    cuda_shared_mem: Option<usize>,
+) {
     println!("🚀 TeamSpeak 3 Security Level Improver\n");
 
     // Determine input mode
@@ -124,8 +132,16 @@ fn increase_level(file: Option<String>, string: Option<String>, target_level: u8
             }
         }
         HasherMethod::Cuda => {
-            println!("⚙️  Method: CUDA\n");
-            match CudaHasher::new() {
+            println!("⚙️  Method: CUDA");
+            let threads = cuda_threads.unwrap_or(128);
+            if let Some(mem) = cuda_shared_mem {
+                println!("   Threads per block: {}", threads);
+                println!("   Shared memory: {} bytes\n", mem);
+            } else {
+                println!("   Threads per block: {}", threads);
+                println!("   Shared memory: {} bytes (auto)\n", threads * 128);
+            }
+            match CudaHasher::with_params(threads, cuda_shared_mem) {
                 Ok(cuda_hasher) => {
                     if let Some(file_path) = file {
                         run_improver_file(&file_path, target_level, cuda_hasher, batch_size);

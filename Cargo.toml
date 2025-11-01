@@ -20,3 +20,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "ts3-sec-cuda-rs"
 path = "src/main.rs"
+
+[[bench]]
+name = "kernel_params"
+path = "benches/kernel_params.rs"
+harness = false
