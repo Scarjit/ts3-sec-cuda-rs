@@ -145,35 +145,56 @@ impl SecurityLevelHasher for CudaHasher {
             return Vec::new();
         }
 
-        // Prepare all messages (public_key + counter)
-        let mut messages_data: Vec<Vec<u8>> = Vec::with_capacity(counters.len());
-        for &counter in counters {
-            let counter_str = counter.to_string();
-            let mut message = Vec::new();
-            message.extend_from_slice(public_key.as_bytes());
-            message.extend_from_slice(counter_str.as_bytes());
-            messages_data.push(message);
+        // Group counters by their string length to enable efficient batch processing
+        // This avoids the variable-length fallback in hash_messages_batch
+        use std::collections::HashMap;
+        let mut length_groups: HashMap<usize, Vec<(usize, u64)>> = HashMap::new();
+
+        for (idx, &counter) in counters.iter().enumerate() {
+            let counter_len = counter.to_string().len();
+            let total_len = public_key.len() + counter_len;
+            length_groups.entry(total_len)
+                .or_insert_with(Vec::new)
+                .push((idx, counter));
         }
 
-        let messages_refs: Vec<&[u8]> = messages_data.iter()
-            .map(|m| m.as_slice())
-            .collect();
+        // Process each length group separately and collect results
+        let mut results = vec![0u8; counters.len()];
 
-        // Hash all messages in batch
-        match self.hash_messages_batch(&messages_refs) {
-            Ok(hashes) => {
-                // Count trailing zero bits for each hash
-                hashes.iter()
-                    .map(|hash| crate::helpers::count_trailing_zero_bits(hash))
-                    .collect()
-            }
-            Err(_) => {
-                // Fall back to sequential processing on error
-                counters.iter()
-                    .map(|&counter| self.calculate_level(public_key, counter))
-                    .collect()
+        for (_len, group) in length_groups {
+            // Prepare messages for this group (all same length)
+            let messages_data: Vec<Vec<u8>> = group.iter()
+                .map(|(_, counter)| {
+                    let counter_str = counter.to_string();
+                    let mut message = Vec::new();
+                    message.extend_from_slice(public_key.as_bytes());
+                    message.extend_from_slice(counter_str.as_bytes());
+                    message
+                })
+                .collect();
+
+            let messages_refs: Vec<&[u8]> = messages_data.iter()
+                .map(|m| m.as_slice())
+                .collect();
+
+            // Hash this group in batch
+            match self.hash_messages_batch(&messages_refs) {
+                Ok(hashes) => {
+                    // Store results in correct positions
+                    for (i, (idx, _)) in group.iter().enumerate() {
+                        results[*idx] = crate::helpers::count_trailing_zero_bits(&hashes[i]);
+                    }
+                }
+                Err(_) => {
+                    // Fall back to sequential processing for this group
+                    for (idx, counter) in group {
+                        results[idx] = self.calculate_level(public_key, counter);
+                    }
+                }
             }
         }
+
+        results
     }
 
     fn name(&self) -> &str {
